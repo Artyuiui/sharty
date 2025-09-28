@@ -1,2 +1,300 @@
 # sharty
-คือการที่เราสร้างคำสั่งลัดไว้ในโฟลเดอร์ที่เราต้องการ
+
+#### 1) เตรียมโฟลเดอร์ + ใส่ PATH (ครั้งเดียว)
+###### คัดลอกวางทีละบรรทัด:
+```
+# สร้างโครงสร้าง
+mkdir -p "$HOME/sharty/bin" "$HOME/sharty/available"
+
+# ใส่ PATH (เฉพาะ zsh ซึ่งเป็นค่าเริ่มต้นบน macOS)
+if ! grep -q 'sharty/bin' "$HOME/.zshrc" 2>/dev/null; then
+  echo 'export PATH="$HOME/sharty/bin:$PATH"' >> "$HOME/.zshrc"
+fi
+
+# โหลด shell ใหม่ในเทอร์มินัลนี้ (หรือปิด-เปิดหน้าต่างเทอร์มินัล)
+exec zsh
+```
+> ถ้าเป็น Linux ที่ยังไม่มี zsh: sudo apt install zsh -y แล้วค่อยทำขั้นตอนต่อไป (สคริปต์หลักเขียนด้วย zsh)
+
+#### 2) ติดตั้งสคริปต์ sharty
+###### สคริปต์นี้รองรับไฟล์ที่มี .sh และไม่มี .sh, เรียกใช้แบบไม่มี .sh, และ “ถามเมื่อชื่อชนกัน”
+
+```
+cat > "$HOME/sharty/bin/sharty" <<'SHARTY'
+#!/usr/bin/env zsh
+set -o errexit
+set -o nounset
+set -o pipefail
+
+BASE="$HOME/sharty"
+SRC="$BASE/available"
+BIN="$BASE/bin"
+
+ensure_dirs() { mkdir -p "$SRC" "$BIN"; }
+strip_ext() { local s="$1"; print -r -- "${s%.sh}"; }
+
+# รวมตัวเลือกไฟล์ต่อ "ชื่อคำสั่ง" (ไฟล์ไม่มี .sh ชนะ)
+pick_candidates() {
+  typeset -gA CANDIDATE
+  CANDIDATE=()
+  setopt local_options null_glob
+  for f in "$SRC"/*; do
+    local base="${f:t}"
+    local name="${base%.sh}"
+    if [[ -z "${CANDIDATE[$name]-}" ]]; then
+      CANDIDATE[$name]="$f"
+    else
+      [[ "$base" != *.sh ]] && CANDIDATE[$name]="$f"
+    fi
+  done
+}
+
+cmd_list() {
+  ensure_dirs
+  print "=== Activated (พร้อมใช้งาน) ==="
+  setopt local_options null_glob
+  local any=0
+  for f in "$BIN"/*; do
+    [[ -x "$f" ]] || continue
+    any=1
+    if [[ -L "$f" ]]; then
+      local tgt
+      tgt="$(readlink "$f" 2>/dev/null || true)"
+      print "• ${f:t} -> $tgt"
+    else
+      print "• ${f:t}"
+    fi
+  done
+  (( any )) || print "(ว่าง)"
+  print
+
+  pick_candidates
+  print "=== Pending / Updates (ยังไม่เปิดใช้หรือมีอัปเดต) ==="
+  any=0
+  for name in ${(k)CANDIDATE}; do
+    local src="$CANDIDATE[$name]"
+    local base="${src:t}"
+    if [[ ! -x "$src" ]]; then
+      print "• $base (ยังไม่ได้ chmod +x)"; any=1; continue
+    fi
+    if [[ ! -e "$BIN/$name" ]]; then
+      print "• $base → (ใหม่, รอ reload)"; any=1; continue
+    fi
+    local cur=""
+    if [[ -L "$BIN/$name" ]]; then cur="$(readlink "$BIN/$name" 2>/dev/null || true)"; else cur="$BIN/$name"; fi
+    if [[ "$cur" != "$src" ]]; then
+      print "• $base → (มีอัปเดต/ชื่อชน, รอ reload)"; any=1
+    fi
+  done
+  (( any )) || print "(ไม่มี)"
+}
+
+auto_rename() {
+  local name="$1"
+  local i=2 cand
+  while true; do
+    cand="${name}-${i}"
+    [[ ! -e "$BIN/$cand" ]] && { print -r -- "$cand"; return; }
+    (( i++ ))
+  done
+}
+
+interactive_conflict() {
+  local name="$1" src="$2"
+  local choice
+  while true; do
+    print
+    local cur
+    cur="$(readlink "$BIN/$name" 2>/dev/null || echo "$BIN/$name")"
+    print "พบชื่อชน: '$name' อยู่แล้วที่ $cur"
+    print "ตัวเลือก: [U]pdate ทับ / [R]ename เปลี่ยนชื่อ / [S]kip ข้าม / [A]ll update ทั้งหมด / s[K]ip ทั้งหมด / [Q]uit"
+    printf "เลือก (U/R/S/A/K/Q): "
+    read -r choice
+    choice="${choice:l}"
+    case "$choice" in
+      u) ln -sfn "$src" "$BIN/$name"; print "อัปเดต: $name -> $src"; print -r -- "update"; return ;;
+      r)
+        local suggestion newname
+        suggestion="$(auto_rename "$name")"
+        printf "ตั้งชื่อใหม่ (ว่าง=ใช้ '%s'): " "$suggestion"
+        read -r newname
+        [[ -z "${newname:-}" ]] && newname="$suggestion"
+        ln -sfn "$src" "$BIN/$newname"
+        print "เพิ่ม (rename): $newname -> $src"
+        print -r -- "renamed"; return
+        ;;
+      s) print "ข้าม: $name"; print -r -- "skip"; return ;;
+      a) print -r -- "all-update"; return ;;
+      k) print -r -- "all-skip"; return ;;
+      q) print -r -- "quit"; return ;;
+      *) print "กรุณาเลือก U/R/S/A/K/Q";;
+    esac
+  done
+}
+
+cmd_reload() {
+  ensure_dirs
+  pick_candidates
+  local added=0 updated=0 skipped=0 renamed=0
+  local all_mode=""
+  local non_interactive=true
+  [[ -t 0 ]] && non_interactive=false
+
+  for name in ${(k)CANDIDATE}; do
+    local src="$CANDIDATE[$name]"
+    local base="${src:t}"
+
+    if [[ ! -x "$src" ]]; then
+      print "ข้าม: $base (ยังไม่ chmod +x)"; ((skipped++)); continue
+    fi
+
+    if [[ ! -e "$BIN/$name" ]]; then
+      ln -sfn "$src" "$BIN/$name"
+      print "เพิ่ม: $name -> $src"; ((added++)); continue
+    fi
+
+    local cur_target
+    if [[ -L "$BIN/$name" ]]; then cur_target="$(readlink "$BIN/$name" 2>/dev/null || true)"; else cur_target="$BIN/$name"; fi
+    if [[ "$cur_target" == "$src" ]]; then
+      print "ข้าม: $name (เหมือนเดิม)"; ((skipped++)); continue
+    fi
+
+    if [[ "$non_interactive" == true ]]; then
+      print "ข้าม: $name (ชนชื่อ; โหมด non-interactive)"; ((skipped++)); continue
+    fi
+
+    if [[ -z "$all_mode" ]]; then
+      local resp
+      resp="$(interactive_conflict "$name" "$src")"
+      case "$resp" in
+        update) ((updated++)) ;;
+        renamed) ((renamed++)) ;;
+        skip) ((skipped++)) ;;
+        all-update) all_mode="update"; ln -sfn "$src" "$BIN/$name"; print "อัปเดต: $name -> $src"; ((updated++)) ;;
+        all-skip) all_mode="skip"; print "ข้าม: $name"; ((skipped++)) ;;
+        quit) print "ยกเลิกการทำงาน"; break ;;
+      esac
+    else
+      if [[ "$all_mode" == "update" ]]; then
+        ln -sfn "$src" "$BIN/$name"; print "อัปเดต: $name -> $src"; ((updated++))
+      else
+        print "ข้าม: $name (all-skip)"; ((skipped++))
+      fi
+    fi
+  done
+
+  print
+  print "สรุป: เพิ่มใหม่ $added, อัปเดต $updated, เปลี่ยนชื่อ $renamed, ข้าม $skipped"
+  print "ถ้าเพิ่งเพิ่ม PATH ใหม่ ให้เปิดเทอร์มินัลใหม่หรือรัน 'exec zsh'"
+}
+
+usage() {
+  cat <<'EOF'
+ใช้ว่า: sharty <list|-l | reload|-re>
+
+  list, -l     แสดงคำสั่งที่เปิดใช้แล้ว + รายการที่รอเปิดใช้/มีอัปเดต
+  reload, -re  สแกน 'available' แล้วสร้าง/อัปเดตลิงก์เข้า 'bin'
+               ถ้าชื่อชน จะถาม: Update / Rename / Skip / All-update / Keep-skip / Quit
+หมายเหตุ:
+  - รองรับไฟล์ที่มี .sh และไม่มี .sh
+  - เรียกใช้งานแบบไม่มี .sh เช่น 'asp'
+  - ถ้ามีทั้ง 'tool' และ 'tool.sh' จะถือ 'tool' เป็นตัวแทนหลักตามค่าเริ่มต้น
+EOF
+}
+
+case "${1:-}" in
+  list|-l)    cmd_list ;;
+  reload|-re) cmd_reload ;;
+  ""|help|-h|--help) usage ;;
+  *) print "ไม่รู้จักคำสั่ง: $1"; print; usage; return 1 ;;
+esac
+SHARTY
+
+# อนุญาตให้รัน
+chmod +x "$HOME/sharty/bin/sharty"
+```
+
+###### ทดสอบว่าเจอคำสั่ง:
+``` zsh
+which sharty
+
+sharty list
+```
+#### 3) วิธีเพิ่ม “คำสั่งของเราเอง”
+> วางไฟล์ที่ ~/sharty/available/ จะชื่อ tool หรือ tool.sh ก็ได้ แต่จะเรียกใช้แบบไม่มี .sh
+##### ตัวอย่าง:
+```
+# สร้างสคริปต์ตัวอย่างชื่อ asp.sh
+cat > "$HOME/sharty/available/asp.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "Hello from asp!"
+EOF
+
+chmod +x "$HOME/sharty/available/asp.sh"
+
+# ตอนนี้ยังเรียกไม่ได้ จนกว่าจะ reload
+asp || true   # คำสั่งยังไม่พบ
+
+# เปิดใช้งาน
+sharty reload
+
+# ใช้ได้แล้ว (ไม่ต้องพิมพ์ .sh)
+asp
+```
+#### 4) ตัวอย่าง “ชื่อชนกัน” และการเลือก Update/Rename/Skip
+##### ลองสร้างไฟล์อีกชุดชื่อเดียวกัน:
+``` zsh
+# สร้างไฟล์ใหม่ชื่อ asp (ไม่มี .sh) เพื่อให้ชนกับ asp.sh
+cat > "$HOME/sharty/available/asp" <<'EOF'
+#!/usr/bin/env bash
+echo "This is NEW asp (no .sh)!"
+EOF
+chmod +x "$HOME/sharty/available/asp"
+
+# reload -> ระบบจะถามว่าทำยังไงกับชื่อ 'asp'
+sharty reload
+```
+\ตอนถาม ให้เลือกได้เลย:\
+	•	U → อัปเดตทับของเดิม\
+	•	R → เปลี่ยนชื่อใหม่ (จะมีชื่อแนะนำ asp-2 อัตโนมัติ หรือพิมพ์เอง)\
+	•	S → ข้ามตัวนี้\
+	•	A → อัปเดตทั้งหมดที่เหลือต่อไปโดยไม่ถาม\
+	•	K → ข้ามทั้งหมดที่เหลือต่อไปโดยไม่ถาม\
+	•	Q → ยกเลิกกลางคัน
+  ##### ดูรายการทั้งหมดอีกครั้ง:
+```
+sharty list
+```
+
+#### 5) ใช้งานประจำ (จำสั้นๆ)
+  ดูคำสั่งที่พร้อมใช้ + ที่รอเปิดใช้: sharty list หรือ sharty -l\
+	เปิดใช้/อัปเดตลิงก์: sharty reload หรือ sharty -re\
+  เรียกคำสั่ง: พิมพ์ชื่อไฟล์ แบบไม่มี .sh เช่น asp
+
+#### 6) เคล็ดลับ & แก้ปัญหาเร็วๆ
+  คำสั่งไม่เจอทั้งที่ reload แล้ว → เช็ก PATH:
+```
+echo $PATH | tr ':' '\n' | nl
+which sharty
+ls -l ~/sharty/bin
+```
+  ถ้าเพิ่งเติม PATH ใน .zshrc → เปิดเทอร์มินัลใหม่ หรือรัน exec zsh\
+  อยาก “ปิดใช้งาน” คำสั่งชั่วคราว → ลบลิงก์ใน ~/sharty/bin/<name> แล้ว sharty list (จะไปโผล่ฝั่ง Pending) หรือ shartyreload ใหม่\
+  macOS ถ้าดาวน์โหลดไฟล์มาแล้วรันไม่ได้เพราะ quarantine:
+
+```
+xattr -d com.apple.quarantine ~/sharty/available/<ไฟล์ของคุณ>
+chmod +x ~/sharty/available/<ไฟล์ของคุณ>
+sharty reload
+```
+#### 7) เอาออก (Uninstall) ถ้าต้องการ
+```
+# เอา PATH ออก
+sed -i.bak '/sharty\/bin/d' "$HOME/.zshrc"
+
+# ลบทั้งโฟลเดอร์
+rm -rf "$HOME/sharty"
+
+# โหลด shell ใหม่
+exec zsh
+```
